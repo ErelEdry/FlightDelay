@@ -1,0 +1,255 @@
+---
+title: "Predicting Flight Departure Delays from Scheduled Characteristics"
+subtitle: "Introduction to Data Science"
+author: "Erel Edry, Idan Hazan, Nadav Zvulun, Reem Mizrahi"
+output:
+  pdf_document:
+    number_sections: false
+    fig_caption: true
+geometry: margin=0.9in
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+# Course rule: tidyverse (and data.table) only for data work; models use base R.
+# echo=FALSE keeps the report clean but fully reproducible.
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 4.0, fig.height = 2.5)
+library(tidyverse)
+set.seed(42)   # makes the 100k sample and all results reproducible
+```
+
+**Code repository:** `(see `README.md` to reproduce).\
+**Data:** US DOT 2015 domestic flights staff-provided, not in the report.
+
+```{r load-clean, cache=TRUE}
+# Read only the columns we need from the large (~5.8M row) flights file.
+flights_raw <- read_csv(
+  "data/flights.csv",
+  col_select = c(MONTH, DAY_OF_WEEK, AIRLINE,
+                 SCHEDULED_DEPARTURE, DEPARTURE_DELAY, DISTANCE),
+  show_col_types = FALSE
+)
+
+# Rename the airlines name column so it doesn't clash with the flights code column.
+airlines <- read_csv("data/airlines.csv", show_col_types = FALSE) %>%
+  rename(Airline_Name = AIRLINE)
+
+# 100k sample, joined to names, cancelled flights removed (missing delay = cancelled).
+flights <- flights_raw %>%
+  sample_n(100000) %>%
+  left_join(airlines, by = c("AIRLINE" = "IATA_CODE")) %>%
+  filter(!is.na(DEPARTURE_DELAY))
+
+# Time_Block levels carry the explicit hour ranges (used on axes + coefficient table).
+tb_levels <- c("Morning (06:00-12:00)", "Afternoon (12:00-18:00)",
+               "Evening (18:00-24:00)", "Night (00:00-06:00)")
+
+major_airlines <- c("UA", "AA", "US", "DL", "AS", "HA")   # legacy carriers
+flights <- flights %>%
+  mutate(
+    is_delayed = if_else(DEPARTURE_DELAY > 15, 1, 0),
+    # SCHEDULED_DEPARTURE is text like "0545": convert, then take the hour.
+    hour = as.integer(SCHEDULED_DEPARTURE) %/% 100,
+    Time_Block = case_when(
+      hour >= 6  & hour < 12 ~ "Morning (06:00-12:00)",
+      hour >= 12 & hour < 18 ~ "Afternoon (12:00-18:00)",
+      hour >= 18 & hour < 24 ~ "Evening (18:00-24:00)",
+      TRUE                   ~ "Night (00:00-06:00)"),
+    MONTH        = factor(MONTH),
+    DAY_OF_WEEK  = factor(DAY_OF_WEEK),
+    Time_Block   = factor(Time_Block, levels = tb_levels),
+    Carrier_Type = if_else(AIRLINE %in% major_airlines, "Major", "Low-Cost")
+  )
+
+delay_rate <- mean(flights$is_delayed)
+cr <- flights %>% group_by(Carrier_Type) %>%
+  summarise(r = mean(is_delayed), .groups = "drop")
+rate_low   <- cr$r[cr$Carrier_Type == "Low-Cost"]
+rate_major <- cr$r[cr$Carrier_Type == "Major"]
+```
+
+# Section 1 - Introduction
+
+Flight delays cost airlines billions of dollars a year and frustrate millions of passengers.
+They push airport schedules off track, force extra spending on crew, fuel, and gate time, and
+make air travel hard to plan. Our research question is: how do a flight's scheduled features
+distance, time of day, day of week, and carrier affect its departure delay, and can we predict
+whether a flight will be delayed by more than 15 minutes? We use 15 minutes because that is the
+cutoff the US DOT uses to label a flight as delayed.
+
+This is hard for two reasons. First, many causes act at the same time weather, busy travel
+seasons, crowded peak hours, so a single feature on its own can mislead. Second, delays cascade:
+the same aircraft and crew fly several legs in a row, so a late first flight tends to make the next
+flights late too. This knock on effect means a small morning delay can grow into large delays by
+the evening.
+
+Prior work shows that timing and carrier carry real signal, but that scheduled features
+alone explain only part of delays, because weather and the wider flight network matter a lot.
+Building on this, we test two hypotheses. **H1:** low cost carriers are delayed more than major
+legacy carriers, since they fly tighter schedules with less spare time. **H2:** delays grow over
+the course of the day, following the knock on effect. We use two models a linear regression for
+how long a delay is, and a logistic regression for whether a flight is delayed and we show how
+two careless choices removing too many outliers, using a 0.5 cutoff can break the analysis, and
+how we fixed them.
+
+# Section 2 - Data overview
+
+Each row is one US domestic flight from the 2015 DOT dataset: **5,819,080 flights** and 31 columns,
+plus lookup tables for airline names and airports. We draw a random sample of **100,000 flights**
+to keep the analysis fast while staying representative; a random sample keeps the same mix of
+carriers, times, and delays as the full data. Flights with a missing DEPARTURE_DELAY were
+**cancelled** they never took off, so we drop them these are not random gaps but a different
+kind of event. After cleaning, **`r format(nrow(flights), big.mark=",")`** flights remain, and
+**`r round(delay_rate*100, 1)`%** are delayed by more than 15 minutes about 1 in 6. We use three
+feature groups plus the target (Table 1).
+
+```{r tbl-features}
+tibble(
+  `Feature group` = c("Temporal", "Carrier", "Distance", "Target"),
+  `Variables`     = c("MONTH, DAY_OF_WEEK, Time_Block (Morning 06-12, Afternoon 12-18, Evening 18-24, Night 00-06)",
+                      "Carrier_Type (Low-Cost vs Major)",
+                      "DISTANCE (miles)",
+                      "DEPARTURE_DELAY (min); is_delayed (1 if > 15 min)"),
+  `Type`          = c("categorical","categorical","numeric","numeric / binary")
+) %>%
+  knitr::kable(caption = "Table 1. Features used in the analysis.")
+```
+
+splits the scheduled hour into Morning (06:00-12:00), Afternoon (12:00-18:00),
+Evening (18:00-24:00), and Night (00:00-06:00). Carrier_Type labels the six legacy carriers
+(UA, AA, US, DL, AS, HA) as **Major** and all others as **Low Cost**. We do not use the airports
+table.
+
+# Section 3 - Methods and results
+
+We run two models with the same predictors, one for each part of the question: a linear regression
+(OLS) for *how long* the delay is, and a logistic regression for *whether* a flight is delayed.
+Running both lets us check that the story holds under two different methods.
+
+**Hypothesis 1 (carrier).** The empirical delay rate is
+**`r round(rate_low*100, 1)`%** for Low Cost carriers versus **`r round(rate_major*100, 1)`%** for
+Major carriers Figure 1. This gap is direct, real world proof behind the negative Major
+coefficient in the logistic model: belonging to a major carrier lowers the chance of a delay.
+
+```{r fig-prop, fig.width=4.0, fig.height=2.5, out.width="60%", fig.cap="Figure 1. Share of flights delayed (>15 min) by carrier type. Low-Cost is clearly higher, supporting H1."}
+flights %>%
+  group_by(Carrier_Type) %>%
+  summarise(delay_rate = mean(is_delayed), .groups = "drop") %>%
+  ggplot(aes(x = Carrier_Type, y = delay_rate, fill = Carrier_Type)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(delay_rate * 100, 1), "%")),
+            vjust = -0.4, size = 2.6) +
+  scale_y_continuous(labels = function(x) paste0(x * 100, "%"),
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "H1: Share of Flights Delayed (>15 min)",
+       x = "Carrier Type", y = "Delayed flights") +
+  theme_minimal(base_size = 8)
+```
+
+**Hypothesis 2 (time of day).** Figure 2 shows departure delay across the four time blocks. The
+spread and upper whisker grow from morning through evening and drop again at night, matching the
+knock on build up we expected.
+
+```{r fig-time, fig.width=4.0, fig.height=2.5, out.width="66%", fig.cap="Figure 2. Departure delay by time block. Delays build from morning to evening and reset at night, supporting H2. Y-axis zoomed to +/-40 min."}
+ggplot(flights, aes(x = Time_Block, y = DEPARTURE_DELAY, fill = Time_Block)) +
+  geom_boxplot(outlier.size = 0.2, linewidth = 0.3, show.legend = FALSE) +
+  coord_cartesian(ylim = c(-20, 40)) +
+  scale_x_discrete(labels = function(x) str_wrap(x, 10)) +
+  labs(title = "H2: Delay by Time of Day", x = NULL, y = "Delay (min)") +
+  theme_minimal(base_size = 8) +
+  theme(axis.text.x = element_text(size = 6))
+```
+
+```{r models}
+# Linear model: remove extreme outliers with the IQR rule -- ONLY here, since OLS
+# is sensitive to them. Doing this on all the data would delete most delayed flights
+# (delay rate drops to ~5.6%) and break the logistic model, so Model 2 uses full data.
+q <- quantile(flights$DEPARTURE_DELAY, c(0.25, 0.75)); iqr <- q[2] - q[1]
+flights_lm <- flights %>%
+  filter(DEPARTURE_DELAY >= q[1] - 1.5*iqr, DEPARTURE_DELAY <= q[2] + 1.5*iqr)
+model_lm  <- lm(DEPARTURE_DELAY ~ DISTANCE + Time_Block + DAY_OF_WEEK + Carrier_Type,
+                data = flights_lm)
+adj_r2    <- summary(model_lm)$adj.r.squared
+
+# Logistic model on the full (cancelled-removed) data.
+model_glm <- glm(is_delayed ~ DISTANCE + Time_Block + DAY_OF_WEEK + Carrier_Type,
+                 family = binomial, data = flights)
+flights   <- flights %>% mutate(pred_prob = predict(model_glm, type = "response"))
+or_evening <- unname(exp(coef(model_glm)["Time_BlockEvening (18:00-24:00)"]))
+or_major   <- unname(exp(coef(model_glm)["Carrier_TypeMajor"]))
+
+# ROC + AUC by hand (tidyverse only).
+roc <- flights %>% arrange(desc(pred_prob)) %>%
+  mutate(TPR = cumsum(is_delayed == 1)/sum(is_delayed == 1),
+         FPR = cumsum(is_delayed == 0)/sum(is_delayed == 0))
+auc <- sum(diff(roc$FPR) * (head(roc$TPR,-1) + tail(roc$TPR,-1))/2)
+
+# Use the delay rate (~0.18) as the cutoff, not 0.5 (which calls everything on-time).
+flights  <- flights %>% mutate(pred_class = if_else(pred_prob > delay_rate, 1, 0))
+accuracy <- mean(flights$pred_class == flights$is_delayed)
+```
+
+**Coefficients.** Both models agree in sign and significance Table 2. Distance barely matters
+about 1 minute per 1,000 miles, which fits the idea that departure delays build on the ground,
+not in the air. Compared to morning, afternoon and evening flights have about +2 minutes of delay
+while night flights are about 1 minute earlier (H2). The Major coefficient is negative, so major
+carriers are delayed less than low cost carriers (H1). On the odds scale, evening flights have
+about **`r round(or_evening, 2)`** times the odds of a delay versus morning, and major carriers
+have about **`r round((1 - or_major) * 100)`%** lower odds than low cost carriers.
+
+```{r tbl-coef}
+k  <- c("DISTANCE", "Time_BlockAfternoon (12:00-18:00)",
+        "Time_BlockEvening (18:00-24:00)", "Time_BlockNight (00:00-06:00)",
+        "Carrier_TypeMajor")
+lb <- c("DISTANCE (per mile)", "Afternoon (12:00-18:00)", "Evening (18:00-24:00)",
+        "Night (00:00-06:00)", "Carrier_Type: Major")
+tibble(Predictor = lb,
+       `Linear (min)`        = round(coef(model_lm)[k], 4),
+       `Logistic (log-odds)` = round(coef(model_glm)[k], 4),
+       `Odds ratio`          = round(exp(coef(model_glm)[k]), 3)) %>%
+  knitr::kable(row.names = FALSE,
+    caption = "Table 2. Key coefficients (all p < 0.001). Baseline = Morning (06:00-12:00), Low-Cost.")
+```
+
+**Model fit.** We check fit instead of only reporting numbers. The linear model's $R^2$ is only
+**`r round(adj_r2, 3)`**, so scheduled features explain about `r round(adj_r2*100, 1)`% of the
+variation in delay. We treat this as a real finding: the biggest causes of delay weather,
+congestion, and the knock on effect are not in our data. For the classifier, the **AUC is
+`r round(auc, 3)`** (Figure 3), which is modest but clearly above the 0.5 line for random guessing,
+so the features carry real signal. We are careful about accuracy: with only about
+`r round(delay_rate*100)`% of flights delayed, a 0.5 cutoff would call almost every flight on time
+and report a misleading accuracy near the base rate. Instead we set the cutoff at the delay rate
+(`r round(delay_rate, 2)`), giving an honest accuracy of **`r round(accuracy, 3)`** from a model
+that actually flags delayed flights.
+
+
+\newpage
+
+```{r fig-roc, fig.width=4.5, fig.height=3.0, out.width="60%", fig.cap="Figure 3. ROC curve for the logistic model; the dashed line is random guessing."}
+ggplot(roc, aes(x = FPR, y = TPR)) +
+  geom_line(color = "#2C7FB8", linewidth = 0.8) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  labs(title = paste0("ROC (AUC = ", round(auc, 3), ")"),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal(base_size = 8)
+```
+
+# Section 4 - Limitations and Future Work
+
+**Limitations.** The biggest limit is that we are missing the main causes of delay. Weather is the
+clearest example: storms, snow, and fog cause many of the largest delays, but our data has no
+weather information at all. The same is true for airport congestion and prior flight delay the
+knock on effect. Because these strong factors are missing, our models explain only a small share
+of delay, and some of their effect may be hidden inside the features we do have for example,
+Time_Block partly stands in for delays that built up earlier in the day. Two other limits
+matter: we test on the same data we trained on, so the scores are a little optimistic; and the
+results come from a single year 2015 of US domestic flights, so they may not hold for other
+years, other countries, or international routes. The 15 minute line for "delayed" is a useful
+standard but still just a cut on a smooth range.
+
+**Future work.** With **one more month**, we would split the data into training and test sets and
+use cross validation for fair scores, and add a "previous flight delay" feature to measure the
+knock on effect directly. With **three more months**, we would bring in outside weather and
+airport congestion data and try tree based models such as random forests to see how much more of
+the delay we can explain while keeping the same honest approach to evaluation.
