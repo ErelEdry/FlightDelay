@@ -162,32 +162,44 @@ ggplot(flights, aes(x = Time_Block, y = DEPARTURE_DELAY, fill = Time_Block)) +
 ```
 
 ```{r models}
-# Linear model: remove extreme outliers with the IQR rule -- ONLY here, since OLS
-# is sensitive to them. Doing this on all the data would delete most delayed flights
-# (delay rate drops to ~5.6%) and break the logistic model, so Model 2 uses full data.
-q <- quantile(flights$DEPARTURE_DELAY, c(0.25, 0.75)); iqr <- q[2] - q[1]
-flights_lm <- flights %>%
-  filter(DEPARTURE_DELAY >= q[1] - 1.5*iqr, DEPARTURE_DELAY <= q[2] + 1.5*iqr)
-model_lm  <- lm(DEPARTURE_DELAY ~ DISTANCE + Time_Block + DAY_OF_WEEK + Carrier_Type,
-                data = flights_lm)
-adj_r2    <- summary(model_lm)$adj.r.squared
+# 80/20 train/test split so every reported score is on flights the model never saw.
+set.seed(42)
+n         <- nrow(flights)
+train_idx <- sample(seq_len(n), size = floor(0.8 * n))
+train     <- flights %>% slice(train_idx)
+test      <- flights %>% slice(-train_idx)
 
-# Logistic model on the full (cancelled-removed) data.
+# Linear model: remove extreme outliers with the IQR rule (from the TRAINING data
+# only) -- ONLY here, since OLS is sensitive to them. Doing this on all the data
+# would delete most delayed flights (delay rate drops to ~5.6%) and break the
+# logistic model, so Model 2 uses the full data.
+q <- quantile(train$DEPARTURE_DELAY, c(0.25, 0.75)); iqr <- q[2] - q[1]
+lo <- q[1] - 1.5*iqr; hi <- q[2] + 1.5*iqr
+train_lm <- train %>% filter(DEPARTURE_DELAY >= lo, DEPARTURE_DELAY <= hi)
+model_lm <- lm(DEPARTURE_DELAY ~ DISTANCE + Time_Block + DAY_OF_WEEK + Carrier_Type,
+               data = train_lm)
+# Held-out R^2: score on the comparable (same IQR window) part of the test set.
+test_lm <- test %>% filter(DEPARTURE_DELAY >= lo, DEPARTURE_DELAY <= hi) %>%
+  mutate(pred = predict(model_lm, newdata = .))
+r2_test <- 1 - sum((test_lm$DEPARTURE_DELAY - test_lm$pred)^2) /
+               sum((test_lm$DEPARTURE_DELAY - mean(test_lm$DEPARTURE_DELAY))^2)
+
+# Logistic model fitted on the training data, scored on the held-out test set.
 model_glm <- glm(is_delayed ~ DISTANCE + Time_Block + DAY_OF_WEEK + Carrier_Type,
-                 family = binomial, data = flights)
-flights   <- flights %>% mutate(pred_prob = predict(model_glm, type = "response"))
+                 family = binomial, data = train)
+test      <- test %>% mutate(pred_prob = predict(model_glm, newdata = test, type = "response"))
 or_evening <- unname(exp(coef(model_glm)["Time_BlockEvening (18:00-24:00)"]))
 or_major   <- unname(exp(coef(model_glm)["Carrier_TypeMajor"]))
 
-# ROC + AUC by hand (tidyverse only).
-roc <- flights %>% arrange(desc(pred_prob)) %>%
+# ROC + AUC by hand on the test set (tidyverse only).
+roc <- test %>% arrange(desc(pred_prob)) %>%
   mutate(TPR = cumsum(is_delayed == 1)/sum(is_delayed == 1),
          FPR = cumsum(is_delayed == 0)/sum(is_delayed == 0))
 auc <- sum(diff(roc$FPR) * (head(roc$TPR,-1) + tail(roc$TPR,-1))/2)
 
 # Use the delay rate (~0.18) as the cutoff, not 0.5 (which calls everything on-time).
-flights  <- flights %>% mutate(pred_class = if_else(pred_prob > delay_rate, 1, 0))
-accuracy <- mean(flights$pred_class == flights$is_delayed)
+test     <- test %>% mutate(pred_class = if_else(pred_prob > delay_rate, 1, 0))
+accuracy <- mean(test$pred_class == test$is_delayed)
 ```
 
 **Coefficients.** Both models agree in sign and significance Table 2. Distance barely matters
@@ -212,16 +224,17 @@ tibble(Predictor = lb,
     caption = "Table 2. Key coefficients (all p < 0.001). Baseline = Morning (06:00-12:00), Low-Cost.")
 ```
 
-**Model fit.** We check fit instead of only reporting numbers. The linear model's $R^2$ is only
-**`r round(adj_r2, 3)`**, so scheduled features explain about `r round(adj_r2*100, 1)`% of the
-variation in delay. We treat this as a real finding: the biggest causes of delay weather,
-congestion, and the knock on effect are not in our data. For the classifier, the **AUC is
-`r round(auc, 3)`** (Figure 3), which is modest but clearly above the 0.5 line for random guessing,
-so the features carry real signal. We are careful about accuracy: with only about
-`r round(delay_rate*100)`% of flights delayed, a 0.5 cutoff would call almost every flight on time
-and report a misleading accuracy near the base rate. Instead we set the cutoff at the delay rate
-(`r round(delay_rate, 2)`), giving an honest accuracy of **`r round(accuracy, 3)`** from a model
-that actually flags delayed flights.
+**Model fit.** We fit both models on 80% of the flights and report every score on the held-out 20%,
+so the numbers reflect how the models do on flights they never saw. The linear model's held-out
+$R^2$ is only **`r round(r2_test, 3)`**, so scheduled features explain about
+`r round(r2_test*100, 1)`% of the variation in delay. We treat this as a real finding: the biggest
+causes of delay weather, congestion, and the knock on effect are not in our data. For the
+classifier, the held-out **AUC is `r round(auc, 3)`** (Figure 3), which is modest but clearly above
+the 0.5 line for random guessing, so the features carry real signal. We are careful about accuracy:
+with only about `r round(delay_rate*100)`% of flights delayed, a 0.5 cutoff would call almost every
+flight on time and report a misleading accuracy near the base rate. Instead we set the cutoff at the
+delay rate (`r round(delay_rate, 2)`), giving an honest accuracy of **`r round(accuracy, 3)`** from a
+model that actually flags delayed flights.
 
 
 \newpage
@@ -242,14 +255,13 @@ clearest example: storms, snow, and fog cause many of the largest delays, but ou
 weather information at all. The same is true for airport congestion and prior flight delay the
 knock on effect. Because these strong factors are missing, our models explain only a small share
 of delay, and some of their effect may be hidden inside the features we do have for example,
-Time_Block partly stands in for delays that built up earlier in the day. Two other limits
-matter: we test on the same data we trained on, so the scores are a little optimistic; and the
-results come from a single year 2015 of US domestic flights, so they may not hold for other
-years, other countries, or international routes. The 15 minute line for "delayed" is a useful
+Time_Block partly stands in for delays that built up earlier in the day. One other limit
+matters: the results come from a single year 2015 of US domestic flights, so they may not hold for
+other years, other countries, or international routes. The 15 minute line for "delayed" is a useful
 standard but still just a cut on a smooth range.
 
-**Future work.** With **one more month**, we would split the data into training and test sets and
-use cross validation for fair scores, and add a "previous flight delay" feature to measure the
+**Future work.** With **one more month**, we would replace our single train/test split with k-fold
+cross validation for more stable scores, and add a "previous flight delay" feature to measure the
 knock on effect directly. With **three more months**, we would bring in outside weather and
 airport congestion data and try tree based models such as random forests to see how much more of
 the delay we can explain while keeping the same honest approach to evaluation.
