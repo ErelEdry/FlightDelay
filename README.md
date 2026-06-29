@@ -3,13 +3,13 @@
 Final project for Introduction to Data Science.
 Erel Edry, Idan Hazan, Nadav Zvulun, Reem Mizrahi.
 
-All code is in `log_try_nadav.Rmd` (knits to PDF).
+All code is in `final_project.Rmd` (knits to PDF).
 
 ## What the code does
 
 The Rmd runs the whole analysis in order:
 
-- Reads `flight_nadav_with_weather.csv`, which is the 2015 DOT flight dataset
+- Reads `flight_with_weather.csv`, which is the 2015 DOT flight dataset
   pre-joined with NOAA daily weather by origin airport and date. Drops
   cancelled flights (missing `DEPARTURE_DELAY`) and any row with a missing
   value across the model features, then draws a uniform 200,000-flight sample.
@@ -50,7 +50,7 @@ standardised.
 The dataset is **not** included here. Place the pre-joined file in a `data/`
 folder next to the Rmd:
 
-- `data/flight_nadav_with_weather.csv`
+- `data/flight_with_weather.csv`
 
 This file contains 2015 DOT on-time records with NOAA daily weather columns
 (`ORIGIN_PRESENT_WEATHER_CODES`, `ORIGIN_WIND_SPEED_KNOTS`, `TMAX`, `TMIN`,
@@ -72,7 +72,7 @@ This file contains 2015 DOT on-time records with NOAA daily weather columns
    From the command line:
 
    ```r
-   rmarkdown::render("log_try_nadav.Rmd", output_format = "pdf_document")
+   rmarkdown::render("final_project.Rmd", output_format = "pdf_document")
    ```
 
 `set.seed(42)` is applied at setup, at the 200K sample, and at the train/test
