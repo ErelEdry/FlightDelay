@@ -66,7 +66,7 @@ This file contains 2015 DOT on-time records with NOAA daily weather columns
 
 2. Place the data file as above.
 
-3. Open `log_try_nadav.Rmd` in RStudio and click Knit to PDF. If you do not
+3. Open `final_project.Rmd` in RStudio and click Knit to PDF. If you do not
    have LaTeX installed, run `tinytex::install_tinytex()` once first.
 
    From the command line:
