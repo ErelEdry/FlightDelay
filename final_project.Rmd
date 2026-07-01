@@ -1,0 +1,403 @@
+---
+title: "Predicting Flight Departure Delays from Scheduled Characteristics, Origin Weather, and the Knock-On Effect"
+author: "Erel Edry, Idan Hazan, Nadav Zvulun, Reem Mizrahi"
+subtitle: "Introduction to Data Science"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: false
+    fig_caption: true
+  html_document:
+    df_print: paged
+geometry: margin=0.22in
+fontsize: 10pt
+header-includes:
+  - \usepackage{xcolor}
+---
+
+```{r setup, include=FALSE}
+# hide code and warnings from the PDF output
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 6.0, fig.height = 3.8)
+library(tidyverse)
+set.seed(42) # fix random seed so results are the same every time we run
+```
+<style>
+/* tighten ### (h3) heading spacing by ~25% vs bootstrap defaults (20px/10px) */
+h3 { margin-top: 15px; margin-bottom: 7.5px; line-height: 0.9; }
+</style>
+```{r data-load}
+# read the CSV file into a dataframe
+flights_raw <- read_csv("data/flight_with_weather.csv", show_col_types = FALSE)
+
+# define the order of time blocks 
+tb_levels <- c("Morning (06:00-12:00)", "Afternoon (12:00-18:00)",
+               "Evening (18:00-24:00)", "Night (00:00-06:00)")
+
+# list of airlines we consider "major" - everything else is "low-cost"
+major_airlines <- c("United Air Lines Inc.", "American Airlines Inc.",
+                    "US Airways Inc.", "Delta Air Lines Inc.",
+                    "Alaska Airlines Inc.", "Hawaiian Airlines Inc.")
+
+flights <- flights_raw %>%
+  mutate(
+    is_delayed     = if_else(DEPARTURE_DELAY > 15, 1, 0),          # 1 if delayed more than 15 min, else 0
+    hour           = as.integer(SCHEDULED_DEPARTURE) %/% 100,       # extract the hour from HHMM format
+    Time_Block     = case_when(                                      # group hour into 4 named time windows
+      hour >= 6  & hour < 12 ~ "Morning (06:00-12:00)",
+      hour >= 12 & hour < 18 ~ "Afternoon (12:00-18:00)",
+      hour >= 18 & hour < 24 ~ "Evening (18:00-24:00)",
+      TRUE                   ~ "Night (00:00-06:00)"),
+    MONTH          = factor(MONTH),                                  # treat month as a category not a number
+    DAY_OF_WEEK    = factor(DAY_OF_WEEK),                           # same for day of week
+    Time_Block     = factor(Time_Block, levels = tb_levels),        # set the display order we defined above
+    Carrier_Type   = if_else(str_trim(AIRLINE) %in% major_airlines, "Major", "Low-Cost"), # label the airline type
+    Carrier_Type   = factor(Carrier_Type),
+    Bad_Weather    = if_else(!is.na(ORIGIN_PRESENT_WEATHER_CODES), 1, 0), # 1 if any weather code exists at origin
+    prev_arr_delay = if_else(is.na(PREV_LEG_ARR_DELAY), 0, PREV_LEG_ARR_DELAY), # if no previous leg treat delay as 0
+    has_prev_leg   = if_else(is.na(PREV_LEG_ARR_DELAY), 0L, 1L),  # flag: did this plane fly a leg before this one
+    Prev_Leg       = factor(case_when(                              # category: was the previous leg late or on time
+      is.na(PREV_LEG_ARR_DELAY) ~ "First leg of day",
+      PREV_LEG_ARR_DELAY > 15   ~ "Inbound late (>15)",
+      TRUE                      ~ "Inbound on-time"),
+      levels = c("First leg of day", "Inbound on-time", "Inbound late (>15)"))
+  ) %>%
+  drop_na(DEPARTURE_DELAY, DISTANCE, DAY_OF_WEEK, Carrier_Type,   # remove rows that are missing any of these columns
+          ORIGIN_WIND_SPEED_KNOTS, Bad_Weather, prev_arr_delay, has_prev_leg,
+          TMAX, TMIN, PRCP)
+set.seed(42)
+flights    <- flights %>% slice_sample(n = 200000)   # keep only 200,000 rows so the model runs faster
+delay_rate <- mean(flights$is_delayed)               # overall fraction of delayed flights used as threshold later
+```
+```{r modelling}
+set.seed(42)
+n         <- nrow(flights)
+train_idx <- sample(seq_len(n), size = floor(0.8 * n)) # randomly pick 80% of the row indices for training
+train     <- flights %>% slice(train_idx)               # training set
+test      <- flights %>% slice(-train_idx)              # test set the remaining 20%
+
+# Base OLS model  uses only scheduled features distance, time, day, carrier
+# we fit it here so r2_base is ready when Section 1 text uses it inline
+model_base <- lm(DEPARTURE_DELAY ~ DISTANCE + Time_Block + DAY_OF_WEEK + Carrier_Type, data = train)
+pred_base  <- predict(model_base, newdata = test)
+r2_base    <- 1 - sum((test$DEPARTURE_DELAY - pred_base)^2, na.rm = TRUE) /
+                  sum((test$DEPARTURE_DELAY - mean(test$DEPARTURE_DELAY, na.rm = TRUE))^2, na.rm = TRUE)
+
+# keep only variables that have more than one unique value in the training set
+# a variable with only one value gives the model zero information
+potential_vars <- c("DISTANCE", "Time_Block", "DAY_OF_WEEK", "Carrier_Type",
+                    "Bad_Weather", "ORIGIN_WIND_SPEED_KNOTS", "prev_arr_delay",
+                    "TMAX", "TMIN", "PRCP")
+valid_vars <- potential_vars[sapply(potential_vars, function(v) {
+  length(unique(train[[v]][!is.na(train[[v]])])) > 1
+})]
+
+# build the logistic regression formula dynamically from valid_vars
+glm_formula <- as.formula(paste("is_delayed ~", paste(valid_vars, collapse = " + ")))
+model_glm   <- glm(glm_formula, family = binomial, data = train)
+
+# add predicted probabilities to the test set
+test        <- test %>%
+  mutate(pred_prob_glm = predict(model_glm, newdata = test, type = "response"))
+
+# compute ROC curve: sort by predicted probability highest first then track TPR and FPR
+roc <- test %>% arrange(desc(pred_prob_glm)) %>%
+  mutate(TPR = cumsum(is_delayed == 1) / sum(is_delayed == 1),
+         FPR = cumsum(is_delayed == 0) / sum(is_delayed == 0))
+
+# AUC = area under the ROC curve computed using the trapezoid rule
+auc      <- sum(diff(roc$FPR) * (head(roc$TPR, -1) + tail(roc$TPR, -1)) / 2)
+
+# classify as "delayed" if predicted probability is above the actual delay rate not 0.5
+
+# because the dataset is imbalanced - most flights are NOT delayed
+
+test     <- test %>% mutate(pred_class_glm = if_else(pred_prob_glm > delay_rate, 1, 0))
+accuracy_glm <- mean(test$pred_class_glm == test$is_delayed)
+
+# compute precision and recall from the confusion matrix counts
+tp    <- sum(test$is_delayed == 1 & test$pred_class_glm == 1, na.rm = TRUE) # true positives
+fp    <- sum(test$is_delayed == 0 & test$pred_class_glm == 1, na.rm = TRUE) # false positives
+fn    <- sum(test$is_delayed == 1 & test$pred_class_glm == 0, na.rm = TRUE) # false negatives
+p_glm   <- if_else((tp + fp) == 0, 0, tp / (tp + fp))  # precision
+r_glm   <- if_else((tp + fn) == 0, 0, tp / (tp + fn))  # recall
+mse_glm <- mean((test$is_delayed - test$pred_prob_glm)^2, na.rm = TRUE)
+
+# baseline delay rate for flights with no previous leg
+base_risk <- mean(flights$is_delayed[flights$has_prev_leg == 0])
+```
+\begin{center}
+\vspace{-1.0em}
+\href{https://github.com/ErelEdry/FlightDelay}{GitHub Link}
+\vspace{-1.0em}
+\end{center}
+### Section 1 - Introduction
+
+Flight delays have a major economic impact, costing the US economy around $28 billion every year (Ball et al., *Total Delay Impact Study*, NEXTOR 2010). These costs come from factors like crew overtime, extra fuel consumption, and missed connections. More importantly, delays usually do not stay isolated to a single location. A disrupted flight often affects the rest of the hub-and-spoke network, delaying later flights that use the same aircraft. This process is known as the **knock-on (or domino) effect**. Since a flight's departure depends on the previous leg arriving on time, a late arrival leaves less time to prepare the plane for its next flight. This creates a chain reaction of delays that gets worse as the day goes on, as documented by AhmadBeygi, Cohn, Guan & Belobaba (*Analysis of the potential for delay propagation in passenger airline networks*, J. Air Transport Management, 2008).
+
+Previous models relying only on scheduled features (carrier, distance, and time of day) showed limited predictive power, explaining just **`r round(r2_base*100,1)`%** of the delay variance on our 200K hold-out set (held-out R² = **`r round(r2_base,3)`**, AUC = 0.631). This limitation stems from missing two crucial drivers: previous flight arrival performance and origin weather. To address this gap, our report integrates both factors to improve the analysis. Therefore,How do scheduled flight characteristics affect departure delay times, and can we predict whether a specific flight will be delayed?
+
+### Section 2 - Data Overview
+
+**Sampling & cleaning.** From the 5.8M-flight 2015 DOT dataset we join NOAA daily weather by origin airport and date, drop cancellations (missing `DEPARTURE_DELAY` , structurally distinct from delays), and keep complete cases across all model features. From this cleaned pool we draw a uniform random sample of **`r format(nrow(flights), big.mark=",")`** flights for analysis, **`r round(delay_rate*100,1)`%** of them delayed (DEPARTURE_DELAY > 15 min, the DOT threshold). This imbalance motivates the calibrated classification threshold in Section 3. 
+
+**Features.** Five groups: _Temporal_ (`MONTH`, `DAY_OF_WEEK`, `Time_Block`); _Carrier & Distance_ (Major/Low-Cost split, route miles); _Weather_ (`Bad_Weather`, `ORIGIN_WIND_SPEED_KNOTS`, `TMAX`, `TMIN`, `PRCP`); _Knock-on_ (`prev_arr_delay` = inbound arrival delay in minutes, set to 0 for first legs, with a `has_prev_leg` flag so the model can separate “no inbound constraint” from “on time inbound”); and _targets_ `DEPARTURE_DELAY` (continuous) and `is_delayed`. 
+
+## Section 3 - Methods and Results
+
+Using an 80/20 train-test split (seed 42), we fit an **OLS regression** for delay duration (`DEPARTURE_DELAY`) and a **logistic regression** for delay probability (`is_delayed`) on identical predictors. This let us cross-check how features affect both delay length and likelihood. 
+
+Standardizing inputs to evaluate feature importance (Figure 1) reveals that the **previous flight's arrival delay (`prev_arr_delay`) is by far the strongest predictor**, confirming that late inbound aircraft primarily drive outbound delays. **Evening flights** rank second, reflecting how delays accumulate throughout the day. Weather has a moderate impact, while distance and carrier type are the weakest - aligning with the fact that delays stem mostly from **ground-level logistics** rather than flight routes. 
+
+```{r fig-importance, fig.width=4.0, fig.height=2.1}
+# scale numeric columns to z-scores (mean=0, sd=1) so coefficients are comparable across variables
+train_scaled <- train %>%
+  mutate(across(any_of(c("DISTANCE", "ORIGIN_WIND_SPEED_KNOTS",
+                          "prev_arr_delay", "TMAX", "TMIN", "PRCP")),
+                ~ as.numeric(scale(.))))
+
+# fit OLS on the scaled data  the absolute coefficient size now shows how "important" each variable is
+model_lm_scaled <- lm(as.formula(paste("DEPARTURE_DELAY ~",
+                      paste(valid_vars, collapse = " + "))), data = train_scaled)
+
+# take absolute values of coefficients drop intercept,then pick the top 7
+var_imp <- abs(coef(model_lm_scaled)[-1])
+imp_df  <- tibble(variable = names(var_imp), importance = var_imp) %>%
+           arrange(desc(importance)) %>% slice_max(importance, n = 7)
+
+# bar chart of feature importance, sorted from most to least important
+ggplot(imp_df, aes(x = reorder(variable, importance), y = importance)) +
+  geom_col(fill = "steelblue") + coord_flip() +
+  labs(title = "Figure 1. Feature Importance",
+       subtitle = "Top 7 predictors",
+       x = "Predictor", y = "Absolute Scaled Coefficient") +
+  theme_minimal(base_size = 10) +
+  theme(plot.title    = element_text(face = "bold", hjust = 0.5, size = 10),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray40", size = 9))
+```
+**Carrier, Weather, and Domino Dynamics.** The empirical delay rate is **`r round(mean(flights$is_delayed[flights$Carrier_Type=="Low-Cost"])*100,1)`%** for low-cost carriers compared to **`r round(mean(flights$is_delayed[flights$Carrier_Type=="Major"])*100,1)`%** for major airlines, likely reflecting the larger turnaround buffers built into major carriers' schedules. Wind speed also increases delay probability (often due to crosswind runway restrictions), with low-cost carriers suffering a larger weather penalty because of their tighter operational margins. Figure 3 highlights the **domino effect**: while the baseline risk for a first-leg flight is just **`r round(base_risk*100,1)`%**, it rises steeply and non-linearly with inbound lateness. Just 30 minutes of inherited delay roughly doubles this baseline risk, eventually pushing the outbound delay probability toward 1.0.
+
+**Model Performance.** Since only **`r round(delay_rate*100,1)`%** of flights in the dataset are delayed, a standard 0.5 classification cutoff would mislabel almost all flights as on-time. To address class imbalance, we set the decision threshold at the empirical delay rate (`r round(delay_rate, 3)` instead of 0.5; Table \ref{tab:metrics}). The AUC of **`r round(auc, 3)`** confirms that weather and knock-on features provide strong, independent predictive signals.
+
+```{r metrics-table}
+# build a one-row table with all the performance metrics of the logistic regression model
+# caption -> LaTeX numbers the float automatically; \label lets the text reference it
+tibble(Model     = "Logistic Regression",
+       Accuracy  = round(accuracy_glm, 4), AUC = round(auc, 4),
+       Precision = round(p_glm, 4), Recall = round(r_glm, 4),
+       MSE       = round(mse_glm, 4)) %>%
+  knitr::kable(align = "c",
+               caption = "Held-out performance metrics (20\\% test set). \\label{tab:metrics}")
+```
+
+```{r fig-roc-domino, fig.width=5.0, fig.height=1.8, out.width='80%'}
+library(patchwork)
+
+# ROC curve: x = false positive rate, y = true positive rate
+# the diagonal dashed line = random guessing (AUC = 0.5)
+p_roc <- ggplot(roc, aes(x = FPR, y = TPR)) +
+  geom_line(color = "#2C7FB8", linewidth = 0.8) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  labs(title = paste0("Figure 2. ROC Curve AUC = ", round(auc, 3), ""),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal(base_size = 7) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 8))
+
+# domino effect plot: only look at flights that had a previous leg
+# x = how late the previous flight arrived, y = probability this flight will be delayed
+p_domino <- flights %>% filter(has_prev_leg == 1) %>%
+  ggplot(aes(x = prev_arr_delay, y = is_delayed)) +
+  geom_hline(yintercept = base_risk, linetype = "dashed", color = "#2CA25F", linewidth = 1.0) +  # baseline delay risk
+  annotate("text", x = 90, y = base_risk + 0.06,
+           label = paste0("Baseline: ", round(base_risk * 100, 1), "%"),
+           color = "#2CA25F", fontface = "bold", size = 2.6) +
+  stat_smooth(method = "glm", method.args = list(family = "binomial"),   # logistic curve fit
+              color = "#E34A33", linewidth = 1.0, se = TRUE, fill = "pink") +
+  coord_cartesian(xlim = c(-15, 150)) +
+  scale_y_continuous(labels = scales::percent_format(), breaks = seq(0, 1, 0.2)) +
+  scale_x_continuous(breaks = seq(-15, 150, 30)) +
+  labs(title = "Figure 3. The Domino Effect", subtitle = "Inbound delay vs. departure delay risk",
+       x = "Inbound Flight Delay (min)", y = "P(Departure Delay > 15 min)") +
+  theme_minimal(base_size = 7) +
+  theme(plot.title       = element_text(face = "bold", hjust = 0.5, size = 8),
+        plot.subtitle    = element_text(hjust = 0.5, color = "gray40", size = 7),
+        panel.grid.minor = element_blank())
+
+# place the two plots side by side
+p_roc + p_domino
+```
+
+## Model Development: Advanced Modeling & Goodness-of-Fit
+
+We improved our baseline models to handle two main issues with the standard OLS: the heavily skewed `prev_arr_delay` data and uneven error variance. We addressed this through a step-by-step approach: log-transforming the delay, adding interaction terms, analyzing residuals, and finally fitting a GLM with a log link.
+
+**Log-scaling `prev_arr_delay`.** This variable has many zeros (first flights of the day) and extreme high values. A log transform compresses these extreme delays and makes the relationship more linear. Since some flights arrive early (negative values), we added a shift constant ($c = |\min(\text{prev\_arr\_delay})| + 2$) to ensure all values are strictly positive before applying the log.
+
+**Extended OLS with Interactions.** We replaced the raw inbound delay with its log version and added three key interactions to capture real-world dynamics:
+(1) **`log_prev × Carrier_Type`**: Do major carriers absorb inherited delays better than low-cost ones?
+(2) **`log_prev × Bad_Weather`**: Does bad weather multiply the impact of an already late inbound flight?
+(3) **`Carrier_Type × Bad_Weather`**: Are certain airlines more vulnerable to weather disruptions?
+
+```{r ext-ols}
+# 0. create the log variable (shift first so log gets a positive number)
+c_shift <- abs(min(train$prev_arr_delay, na.rm = TRUE)) + 2
+train <- train %>% mutate(log_prev_arr_delay = log(prev_arr_delay + c_shift))
+test <- test %>% mutate(log_prev_arr_delay = log(prev_arr_delay + c_shift))
+
+#    compute the mean of the log variable on the train set, then center it
+#    centering means: subtract the mean so the average value becomes 0
+#    this makes the other coefficients easier to interpret
+
+mean_log_delay <- mean(train$log_prev_arr_delay, na.rm = TRUE)
+train <- train %>% mutate(log_prev_arr_delay_centered = log_prev_arr_delay - mean_log_delay)
+test <- test %>% mutate(log_prev_arr_delay_centered = log_prev_arr_delay - mean_log_delay)
+
+#  fit the extended OLS model using the centered log variable
+model_ols_ext <- lm(
+  DEPARTURE_DELAY ~ log_prev_arr_delay_centered + Carrier_Type + Bad_Weather +
+    ORIGIN_WIND_SPEED_KNOTS + TMAX + TMIN + PRCP + Time_Block + DAY_OF_WEEK + DISTANCE +
+    log_prev_arr_delay_centered:Carrier_Type + log_prev_arr_delay_centered:Bad_Weather +
+    Carrier_Type:Bad_Weather,
+  data = train
+)
+
+# compute R² on the test set held-out to see how well the model generalizes
+pred_ext <- predict(model_ols_ext, newdata = test)
+r2_ext   <- 1 - sum((test$DEPARTURE_DELAY - pred_ext)^2, na.rm = TRUE) /
+                sum((test$DEPARTURE_DELAY - mean(test$DEPARTURE_DELAY, na.rm = TRUE))^2, na.rm = TRUE)
+
+# pull the coefficients we care about from the model and put them in a table
+
+ext_terms <- c("log_prev_arr_delay_centered", "Carrier_TypeMajor", "Bad_Weather",
+               "log_prev_arr_delay_centered:Carrier_TypeMajor",
+               "log_prev_arr_delay_centered:Bad_Weather", "Carrier_TypeMajor:Bad_Weather")
+
+co_ext <- summary(model_ols_ext)$coefficients
+co_ext_filtered <- co_ext[rownames(co_ext) %in% ext_terms, , drop = FALSE]
+
+tibble(
+  Term = rownames(co_ext_filtered),
+  Estimate = round(co_ext_filtered[, 1], 3),
+  SE = round(co_ext_filtered[, 2], 3),
+  `t-value` = round(co_ext_filtered[, 3], 2),
+  `p-value` = formatC(co_ext_filtered[, 4], format = "e", digits = 2)
+) %>%
+  knitr::kable(caption = "Extended OLS - key coefficients. \\label{tab:extols}")
+```
+
+Tested on the exact same 200K hold-out set, the baseline OLS (relying only on scheduled features) yields an R² of **`r round(r2_base,3)`**. Incorporating the knock-on effect and interaction terms boosts the R² to **`r round(r2_ext,3)`** (Table \ref{tab:bench}). To maintain interpretable main effects within these interactions, we mean-centered the `log_prev_arr_delay` variable. This adjustment ensures the `Bad_Weather` coefficient accurately reflects the delay penalty under average inbound-delay conditions, resolving the distorted estimates produced by an uncentered model.
+
+**Residual Diagnostics.** Finally, we analyzed the extended model's training residuals to check for homoscedasticity and normality (Figures 4–5).
+```{r s5-diagnostics, fig.width=5.0, fig.height=1.6, out.width='80%'}
+library(patchwork)
+
+# get fitted values and residuals from the extended OLS model
+
+diag_df <- tibble(fitted = fitted(model_ols_ext), residuals = residuals(model_ols_ext))
+
+# sample 10,000 points for the scatter plot so it renders faster
+
+diag_df_sampled <- diag_df %>% sample_n(min(10000, nrow(diag_df)))
+
+# plot 1: residuals vs fitted values checking if errors spread evenly homoscedasticity
+# ideally the red LOESS line should stay flat near zero
+
+p1 <- ggplot(diag_df_sampled, aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.15, size = 0.3, color = "#2C7FB8") +
+  geom_hline(yintercept = 0, color = "firebrick", linewidth = 0.4, linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, color = "#E34A33", linewidth = 0.5, span = 0.4) +
+  coord_cartesian(ylim = c(-60, 120)) +
+  labs(title = "Figure 4. Residuals vs Fitted", subtitle = "Homoscedasticity check",
+       x = "Fitted (min)", y = "Residuals (min)") +
+  theme_minimal(base_size = 6)
+
+# plot 2: histogram of residuals with a normal curve on top checking if errors are roughly normal
+
+p2 <- ggplot(diag_df, aes(x = residuals)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 80, fill = "steelblue",
+                 color = "white", alpha = 0.85) +
+  stat_function(fun = dnorm, args = list(mean = mean(diag_df$residuals),
+                sd = sd(diag_df$residuals)), color = "firebrick", linewidth = 0.6) +
+  coord_cartesian(xlim = c(-80, 160)) +
+  labs(title = "Figure 5. Histogram of Residuals", subtitle = "Normality check",
+       x = "Residual (min)", y = "Density") +
+  theme_minimal(base_size = 6)
+
+p1 + p2
+```
+
+Residual spread fans out with fitted value (**heteroscedasticity**), a structural feature of delay data (bounded below near −30 min, unbounded above), while the LOESS line stays near zero - so OLS estimates remain unbiased but standard errors are unreliable (robust SE or a variance-stabilising GLM are the fix). Residuals are strongly right-skewed, so normal prediction intervals are too narrow in the right tail; point estimates stay valid via the CLT. 
+
+**GLM with log link.** To handle skew in a principled way we fit a Gamma GLM with a **log link**: $E[\text{delay} | X] = \exp(X\beta)$, so predictors act multiplicatively and fitted means stay non-negative. The response is shifted by $c_y = |\min(\text{DEPARTURE\_DELAY})| + 1$ to keep the link argument positive. 
+
+```{r s5-glm-dynamic}
+
+#   shift the target variable so all values are positive Gamma GLM needs that
+#   then fit the GLM model
+
+c_y <- abs(min(train$DEPARTURE_DELAY, na.rm = TRUE)) + 1
+train_glm <- train %>% mutate(DEP_DELAY_SHIFT = DEPARTURE_DELAY + c_y)
+
+model_glm_log <- glm(
+  DEP_DELAY_SHIFT ~ log_prev_arr_delay + Carrier_Type + Bad_Weather +
+    ORIGIN_WIND_SPEED_KNOTS + TMAX + TMIN + PRCP + Time_Block + DAY_OF_WEEK + DISTANCE,
+  family = Gamma(link = "log"),
+  data = train_glm,
+  control = glm.control(maxit = 100)
+)
+
+# compute RMSE on the test set  remember to shift predictions back by c_y
+# DEP_DELAY_SHIFT is the response the model learned, so we undo the shift here
+
+pred_glm_orig <- predict(model_glm_log, newdata = test, type = "response") - c_y
+rmse_glm_log  <- sqrt(mean((test$DEPARTURE_DELAY - pred_glm_orig)^2, na.rm = TRUE))
+rmse_ols_ext  <- sqrt(mean((test$DEPARTURE_DELAY - pred_ext)^2, na.rm = TRUE))
+
+#  pull the GLM coefficients we care about and display them as a table
+
+glm_terms <- c("(Intercept)", "log_prev_arr_delay", "Carrier_TypeMajor", "Bad_Weather", "ORIGIN_WIND_SPEED_KNOTS", "PRCP")
+co_glm <- summary(model_glm_log)$coefficients
+co_glm_filtered <- co_glm[rownames(co_glm) %in% glm_terms, , drop = FALSE]
+
+tibble(
+  Term = rownames(co_glm_filtered),
+  Estimate = round(co_glm_filtered[, 1], 4),
+  SE = round(co_glm_filtered[, 2], 4),
+  `t-value` = round(co_glm_filtered[, 3], 2),
+  `p-value` = formatC(co_glm_filtered[, 4], format = "e", digits = 2)
+) %>%
+  knitr::kable(caption = "GLM (Gamma, log link) - key coefficients. \\label{tab:glm}")
+```
+In this GLM, each coefficient represents a **multiplicative effect**, where $\exp(\hat{\beta})$ is the factor by which the expected delay changes per unit. 
+
+We prefer the GLM over the extended OLS for several practical reasons. First, it logically guarantees non-negative delay predictions. Second, it outperforms the OLS across all three evaluation metrics (R², RMSE, and MAE). For instance, the GLM achieved an RMSE of **`r round(rmse_glm_log,2)`** minutes, compared to **`r round(rmse_ols_ext,2)`** minutes for the extended OLS. Because all regression models were evaluated on the exact same 200K hold-out set with identical metrics (Table \ref{tab:bench}), these performance gains represent a direct and fair comparison.
+
+Theoretically, the Gamma distribution is appropriate here because its variance increases with the mean, which naturally addresses the heteroscedasticity observed in our earlier diagnostics (Figures 4–5). However, we note that this theoretical advantage is only partially realized in our specific case. The additive shift ($c_y$) required for the log transformation compresses the mean's dynamic range, which somewhat reduces this variance structure.
+
+```{r benchmark-table}
+# helper function: given actual values and predictions, return R², RMSE, and MAE
+
+metrics <- function(actual, pred) {
+  ss_tot <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+  tibble(R2   = 1 - sum((actual - pred)^2, na.rm = TRUE) / ss_tot,
+         RMSE = sqrt(mean((actual - pred)^2, na.rm = TRUE)),
+         MAE  = mean(abs(actual - pred), na.rm = TRUE))
+}
+
+# compare all three models on the same test set
+
+y <- test$DEPARTURE_DELAY
+bind_rows(
+  tibble(Model = "Base OLS (scheduled only)")         %>% bind_cols(metrics(y, pred_base)),
+  tibble(Model = "Extended OLS (log + interactions)") %>% bind_cols(metrics(y, pred_ext)),
+  tibble(Model = "GLM (Gamma, log link)")             %>% bind_cols(metrics(y, pred_glm_orig))
+) %>%
+  mutate(across(c(R2, RMSE, MAE), ~ round(., 3))) %>%
+  knitr::kable(caption = "Same-data model comparison - 200K hold-out (20\\% test): held-out R², RMSE (min) and MAE (min). \\label{tab:bench}")
+```
+
+## Section 4 — Limitations and Future Work
+
+Several structural gaps remain in our analysis. DOT records do not track airport ground congestion or air traffic control (ATC) stops, and relying solely on 2015 data misses long-term trends. Furthermore, our weather features use **daily** summaries rather than exact departure hours, meaning the model cannot capture the impact of sudden, short-lived weather changes. 
+
+**Future Work.** To address these limitations, future research should integrate **hourly METAR weather data** and FAA congestion metrics to capture conditions at the exact time of flight. Additionally, expanding the analysis to multiple years and applying non-linear ensemble models (such as **Random Forest or XGBoost**) would better capture the complex, compounding interactions between local weather and network-wide disruptions.
